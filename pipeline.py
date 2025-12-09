@@ -1,136 +1,246 @@
-import os
-import boto3
 import importlib.util
 import polars as pl
 from prefect import flow
 from prefect.tasks import Task
 from prefect.states import Cancelled
-from models.base import PipelineStep, Pipeline, Code
+from prefect.futures import wait
+from prefect.logging import get_run_logger
+from prefect import cache_policies
+
+from stores.store import Store
+from models.base import PipelineStep, Pipeline, Code, Checkpoint, Batch
 from toolkits.delta import load_delta, load_delta_cdc, save_delta
-from helpers.config import Settings
-from helpers.sessions import S3Session
-from helpers import store
+from helpers.sessions import get_store_session
+from helpers import misc, s3
 
 
-def _load_task(settings: Settings, s3: S3Session, step: PipelineStep):
-    object = store.get_object(settings, s3, step.script)
-    code = object.decode("utf-8")
+def _load_script(store, step):
+    object = store.get_object(step.script)
+    script = object.decode("utf-8")
+    return script
+
+
+def _load_python_module(store, step):
+    object = store.get_object(step.script)
+    script = object.decode("utf-8")
     spec = importlib.util.spec_from_loader(step.name, loader=None)
     module = importlib.util.module_from_spec(spec)
-    exec(code, module.__dict__)
-    return Task(fn=module.run, name=step.name)
+    exec(script, module.__dict__)
+    return module
+
+
+def _run_step(store: Store, batch: str, step: PipelineStep):
+    logger = get_run_logger()
+    logger.info(f"step={step}")
+    manifest = store.get_manifest(step.script)
+    code = Code.model_validate_json(manifest)
+    logger.info(f"code={code}")
+    if step.options.get("read_mode", "cdc") == "cdc":
+        try:
+            checkpoint = store.get_checkpoint(f"{batch}.{step.name}")
+        except:
+            checkpoint = Checkpoint(state="none", offsets={})
+        offsets = {}
+        start_time = misc.make_ts()
+        store.set_checkpoint(
+            f"{batch}.{step.name}",
+            Checkpoint(
+                state="running",
+                offsets=checkpoint.offsets,
+                start_time=start_time,
+                end_time=None,
+            ),
+        )
+        logger.info(f"checkpoint={checkpoint}")
+        if code.type.lower() == "sql":
+            ctx = pl.SQLContext()
+            for key, value in step.inputs.items():
+                df, offsets[key] = load_delta_cdc(
+                    s3.get_table_url(value),
+                    checkpoint.offsets.get(key, 0),
+                )
+                logger.info(f"{key}={df}")
+                ctx.register(key, df)
+            try:
+                query = _load_script(store, step)
+                df = ctx.execute(query).collect()
+                logger.info(f"outputs={df}")
+            except Exception as e:
+                store.set_checkpoint(
+                    f"{batch}.{step.name}",
+                    Checkpoint(
+                        state="error",
+                        offsets=checkpoint.offsets,
+                        comment=str(e),
+                        start_time=start_time,
+                        end_time=misc.make_ts(),
+                    ),
+                )
+                raise
+            for key, value in step.outputs.items():
+                save_delta(
+                    s3.get_table_url(value),
+                    df,
+                    write_mode=step.options.get("write_mode", "append"),
+                )
+        else:
+            args = {}
+            for key, value in step.inputs.items():
+                args[key], offsets[key] = load_delta_cdc(
+                    s3.get_table_url(value),
+                    checkpoint.offsets.get(key, 0),
+                )
+                logger.info(f"{key}={args[key]}")
+            try:
+                module = _load_python_module(store, step)
+                outputs = module.run(**args, options=step.options)
+                logger.info(f"outputs={outputs}")
+                if outputs is not None:
+                    for name, df in outputs.items():
+                        save_delta(
+                            s3.get_table_url(step.outputs[name]),
+                            df,
+                            write_mode=step.options.get("write_mode", "append"),
+                        )
+            except Exception as e:
+                store.set_checkpoint(
+                    f"{batch}.{step.name}",
+                    Checkpoint(
+                        state="error",
+                        offsets=checkpoint.offsets,
+                        comment=str(e),
+                        start_time=start_time,
+                        end_time=misc.make_ts(),
+                    ),
+                )
+                raise
+        logger.info(f"offsets={offsets}")
+        store.set_checkpoint(
+            f"{batch}.{step.name}",
+            Checkpoint(
+                state="ready",
+                offsets=offsets,
+                start_time=start_time,
+                end_time=misc.make_ts(),
+            ),
+        )
+    else:
+        start_time = misc.make_ts()
+        store.set_checkpoint(
+            f"{batch}.{step.name}",
+            Checkpoint(
+                state="running",
+                offsets={},
+                start_time=start_time,
+                end_time=None,
+            ),
+        )
+        if code.type.lower() == "sql":
+            ctx = pl.SQLContext()
+            for key, value in step.inputs.items():
+                id, version = _split_id_with_version(value)
+                df = load_delta(s3.get_table_url(id), version)
+                ctx.register(key, df)
+                logger.info(f"{key}={df}")
+            try:
+                query = _load_script(store, step)
+                df = ctx.execute(query).collect()
+                logger.info(f"outputs={df}")
+            except Exception as e:
+                store.set_checkpoint(
+                    f"{batch}.{step.name}",
+                    Checkpoint(
+                        state="error",
+                        offsets={},
+                        comment=str(e),
+                        start_time=start_time,
+                        end_time=misc.make_ts(),
+                    ),
+                )
+                raise
+            for key, value in step.outputs.items():
+                save_delta(
+                    s3.get_table_url(value),
+                    df,
+                    write_mode=step.options.get("write_mode", "append"),
+                )
+        else:
+            args = {}
+            for key, value in step.inputs.items():
+                id, version = _split_id_with_version(value)
+                args[key] = load_delta(s3.get_table_url(id), version)
+                logger.info(f"{key}={args[key]}")
+            try:
+                module = _load_python_module(store, step)
+                outputs = module.run(**args, options=step.options)
+                logger.info(f"outputs={outputs}")
+                if outputs is not None:
+                    for name, df in outputs.items():
+                        save_delta(
+                            s3.get_table_url(step.outputs[name]),
+                            df,
+                            write_mode=step.options.get("write_mode", "append"),
+                        )
+            except Exception as e:
+                store.set_checkpoint(
+                    f"{batch}.{step.name}",
+                    Checkpoint(
+                        state="error",
+                        offsets={},
+                        comment=str(e),
+                        start_time=start_time,
+                        end_time=misc.make_ts(),
+                    ),
+                )
+                raise
+        store.set_checkpoint(
+            f"{batch}.{step.name}",
+            Checkpoint(
+                state="ready",
+                offsets={},
+                start_time=start_time,
+                end_time=misc.make_ts(),
+            ),
+        )
 
 
 @flow(log_prints=True)
-def run_pipeline(settings: Settings, pipeline: Pipeline):
-    config = {
-        "endpoint_url": settings.AWS_ENDPOINT_URL,
-        "aws_access_key_id": settings.AWS_ACCESS_KEY_ID,
-        "aws_secret_access_key": settings.AWS_SECRET_ACCESS_KEY,
-        "region_name": settings.AWS_REGION,
-    }
-    if settings.AWS_ENDPOINT_URL and settings.AWS_ENDPOINT_URL.startswith("https"):
-        config["verify"] = True
-    elif settings.AWS_ENDPOINT_URL and settings.AWS_ENDPOINT_URL.startswith("http://"):
-        config["verify"] = False
-    s3 = boto3.client("s3", **config)
-    batch_id = os.getenv("BATCH_ID")
-    for step in pipeline.steps:
-        manifest = store.get_manifest(settings, s3, step.script)
-        code = Code.model_validate_json(manifest)
-        if step.options.get("read_mode", "cdc") == "cdc":
-            try:
-                offset = store.get_checkpoint(settings, s3, f"{batch_id}.{step.name}")
-                offset = int(offset)
-            except:
-                offset = 0
-            print(f"{step.name} >> {offset}")
-            if code.type.lower() == "sql":
-                object = store.get_object(settings, s3, step.script)
-                query = object.decode("utf-8")
-                ctx = pl.SQLContext()
-                for key, value in step.inputs.items():
-                    table = store.get_table_url(settings, value)
-                    df, offset = load_delta_cdc(settings, table, offset)
-                    ctx.register(key, df)
-                try:
-                    df = ctx.execute(query).collect()
-                except Exception as e:
-                    return Cancelled(message=str(e))
-                for key, value in step.outputs.items():
-                    table = store.get_table_url(settings, value)
-                    save_delta(
-                        settings,
-                        table,
-                        df,
-                        write_mode=step.options.get("write_mode", "append"),
-                    )
-            else:
-                args = {}
-                for key, value in step.inputs.items():
-                    table = store.get_table_url(settings, value)
-                    args[key], offset = load_delta_cdc(settings, table, offset)
-                task = _load_task(settings, s3, step)
-                try:
-                    print(f"{step.name}={args}")
-                    outputs = task.submit(**args, options=step.options).result()
-                    print(f"{step.name}={outputs}")
-                    if outputs is not None:
-                        for name, df in outputs.items():
-                            table = store.get_table_url(settings, step.outputs[name])
-                            save_delta(
-                                settings,
-                                table,
-                                df,
-                                write_mode=step.options.get("write_mode", "append"),
-                            )
-                except Exception as e:
-                    return Cancelled(message=str(e))
-            print(f"{step.name} << {offset + 1}")
-            store.set_checkpoint(
-                settings, s3, f"{batch_id}.{step.name}", str(offset + 1)
-            )
-        else:
-            print(f"{step.name}")
-            if code.type.lower() == "sql":
-                object = store.get_object(settings, s3, step.script)
-                query = object.decode("utf-8")
-                ctx = pl.SQLContext()
-                for key, value in step.inputs.items():
-                    table = store.get_table_url(settings, value)
-                    df = load_delta(settings, table)
-                    ctx.register(key, df)
-                try:
-                    df = ctx.execute(query).collect()
-                except Exception as e:
-                    return Cancelled(message=str(e))
-                for key, value in step.outputs.items():
-                    table = store.get_table_url(settings, value)
-                    save_delta(
-                        settings,
-                        table,
-                        df,
-                        write_mode=step.options.get("write_mode", "append"),
-                    )
-            else:
-                args = {}
-                for key, value in step.inputs.items():
-                    table = store.get_table_url(settings, value)
-                    args[key] = load_delta(table, settings)
-                task = _load_task(settings, s3, step)
-                try:
-                    print(f"{step.name}={args}")
-                    outputs = task.submit(**args, options=step.options).result()
-                    print(f"{step.name}={outputs}")
-                    if outputs is not None:
-                        for name, df in outputs.items():
-                            table = store.get_table_url(settings, step.outputs[name])
-                            save_delta(
-                                settings,
-                                table,
-                                df,
-                                write_mode=step.options.get("write_mode", "append"),
-                            )
-                except Exception as e:
-                    return Cancelled(message=str(e))
-            print(f"{step.name}")
+def run_pipeline(pipeline: Pipeline, batch: Batch):
+    store = get_store_session()
+    steps = pipeline.steps
+    while steps:
+        indices = []
+        for index, step in enumerate(steps):
+            if not _check_dependency(steps, step):
+                indices.append(index)
+        nexts = []
+        for index in reversed(indices):
+            step = steps.pop(index)
+            nexts.append(step)
+        try:
+            futures = []
+            for step in nexts:
+                task = Task(
+                    fn=_run_step,
+                    name=step.name,
+                    cache_policy=cache_policies.NO_CACHE,
+                )
+                futures.append(task.submit(store, batch.id, step))
+            wait(futures)
+        except Exception as e:
+            return Cancelled(message=str(e))
+
+
+def _check_dependency(steps, target):
+    outputs = set(target.inputs.values())
+    for step in steps:
+        if not outputs.isdisjoint(step.outputs.values()):
+            return True
+    return False
+
+
+def _split_id_with_version(id):
+    tokens = id.split("@")
+    if len(tokens) == 2:
+        return tokens[0], int(tokens[1])
+    return tokens[0], None
